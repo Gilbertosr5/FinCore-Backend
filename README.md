@@ -48,21 +48,17 @@ npm run build
 
 ## Ligando o frontend
 
-O axios do frontend só envia o header `X-XSRF-TOKEN` para a **mesma origem**.
-Com front em `:5173` e API em `:8080` as gravações seriam recusadas (403). Use o
-proxy do Vite (recomendado — sem CORS, cookies na mesma origem):
-
-```ts
-// fincore/vite.config.ts → server
-proxy: { '/api': 'http://localhost:8080' },
-```
+Já configurado no frontend (11/11/2026) e testado no navegador:
 
 ```bash
-# fincore/.env.local
-VITE_DATA_SOURCE=api
-VITE_AUTH_ADAPTER=rest
-VITE_API_BASE_URL=http://localhost:5173/api/v1
+cd fincore-api && npm run dev     # API em :8080
+cd fincore && npm run dev:api     # front em http://localhost:5180 (usa fincore/.env.api)
 ```
+
+O axios do frontend só envia o header `X-XSRF-TOKEN` para a **mesma origem**, então o
+Vite encaminha `/api` para a API (`server.proxy` em `fincore/vite.config.ts`; outro
+destino via `FINCORE_API_URL`) e o front usa `VITE_API_BASE_URL=http://localhost:5180/api/v1`.
+Com front e API em origens diferentes as gravações seriam recusadas (403).
 
 Em produção, sirva front e API sob o mesmo domínio (ex.: `app.exemplo.com` e
 `app.exemplo.com/api`) ou configure `CORS_ORIGINS` e `withXSRFToken` no axios.
@@ -83,7 +79,7 @@ src/
     error-handler.ts     tudo vira Problem Details (RFC 9457)
   shared/                dinheiro, datas, validação, histórico (audit), erros
   modules/<recurso>/     schemas Zod do contrato + regras + rotas
-tests/                   integração (HTTP real + PGlite em memória)
+tests/                   integração (HTTP real + PGlite em memória); integrity.test.ts = ADR 0015
 ```
 
 Princípios:
@@ -130,9 +126,9 @@ Prefixo `/api/v1`. Todos, exceto `/auth/*`, exigem sessão (`401` sem ela).
 | Compras no cartão      | `GET /credit-cards/purchases`, `GET/PUT /credit-cards/purchases/{id}`                                                        |
 | Orçamentos             | `GET /budgets`, `GET/PUT/DELETE /budgets/{id}`                                                                               |
 | Metas                  | `GET /goals`, `GET/PUT/DELETE /goals/{id}`                                                                                   |
-| Aportes                | `GET /goals/contributions`, `PUT/DELETE /goals/contributions/{id}`                                                           |
+| Aportes                | `GET /goals/contributions`, `PUT/DELETE /goals/contributions/{id}` (com as pernas da transferência — atômico)                |
 | Ativos                 | `GET /investments/assets`, `PUT/DELETE /investments/assets/{id}`                                                             |
-| Movimentações          | `GET /investments/movements`, `PUT/DELETE /investments/movements/{id}`                                                       |
+| Movimentações          | `GET /investments/movements`, `PUT/DELETE /investments/movements/{id}` (com o lançamento da conta — atômico)                 |
 | Avaliações             | `GET /investments/valuations`, `PUT/DELETE /investments/valuations/{id}`                                                     |
 | Indicadores de mercado | `GET /market/indicators` → `501` (sem provedor ainda; o front trata como indisponível)                                       |
 | Histórico              | `GET /audit-log?entityType=&entityId=`                                                                                       |
@@ -145,6 +141,10 @@ Novo usuário recebe as **14 categorias padrão** (as mesmas da demonstração).
   `cardPayment`, `investment`); contrapartida ≠ conta; pago exige `paidDate`;
   conta, contrapartida, cartão, ativo e categoria precisam existir; receita/despesa
   exigem categoria do mesmo tipo; ids únicos no lote.
+- **Pagamento de fatura** (`card_payment` pago): fatura derivada das compras
+  (`src/modules/credit-cards/invoices.ts`, porte do front); recusa data futura,
+  fatura ainda não aberta, fatura sem saldo e valor acima do saldo em aberto
+  (pagamentos do mesmo lote somam). Só revalida quando o pagamento passa a liquidar mais.
 - **Categorias:** nome único por tipo (sem diferenciar maiúsculas); exclusão e troca
   de tipo bloqueadas se em uso (lançamentos, recorrências, compras, orçamentos).
 - **Cartões:** dias 1–31, limite > 0, conta de pagamento existente; id `purchases`
@@ -156,26 +156,27 @@ Novo usuário recebe as **14 categorias padrão** (as mesmas da demonstração).
 - **Metas:** valor > 0, data final > inicial, conta existente e não arquivada; exclusão
   só sem aportes; id `contributions` reservado.
 - **Aportes:** meta ativa, data entre o início da meta e hoje, saldo acumulado nunca
-  negativo (inclusive ao excluir).
+  negativo (inclusive ao excluir). Com `transactions` (pernas da transferência), aporte e
+  transferência são gravados na mesma transação; o `DELETE` remove as pernas junto.
 - **Investimentos:** ticker único; tipo de movimentação compatível com a classe;
   quantidade obrigatória em compra/venda de ações/FIIs/ETFs/cripto; data não futura;
   venda acima da carteira recusada (inclusive ao excluir uma compra); troca de classe
-  só se compatível; uma avaliação por ativo/data; `market_quote` só pelo servidor.
+  só se compatível; uma avaliação por ativo/data; `market_quote` só pelo servidor;
+  **resgate acima do valor da posição** recusado (`src/modules/investments/position.ts`).
+  Com `transaction`, movimentação e lançamento são gravados juntos; o `DELETE` remove
+  o lançamento vinculado. Decisões: ADR 0015 do frontend.
 
 ## Pendências do backend
 
-- [ ] Validar **pagamento de fatura** no lote (não exceder o saldo em aberto; não pagar
-      fatura futura) — exige portar o cálculo de faturas (`buildInvoices`) do front.
-- [ ] Validar **resgate acima do valor da posição** (exige portar `computePosition`).
-- [ ] Endpoints atômicos recomendados: aporte + transferência e movimentação + lançamento
-      em uma única requisição.
+- [x] Validar **pagamento de fatura** no lote e **resgate acima da posição** (12/11/2026).
+- [x] Aporte + transferência e movimentação + lançamento atômicos (12/11/2026).
 - [ ] Provedor de e-mail real (interface `Mailer`).
 - [ ] Indicadores de mercado e cotações (`market_quote`).
 - [ ] Paginação/filtros no servidor; header `Idempotency-Key` (hoje as gravações já são
       idempotentes por id).
 - [ ] Rate limit distribuído (Redis) se houver mais de uma instância; limpeza periódica
       de sessões e tokens expirados.
-- [ ] Teste ponta a ponta com o frontend (`VITE_DATA_SOURCE=api`) — os adaptadores REST
-      do front nunca rodaram contra um servidor real.
+- [x] Testes E2E automatizados no modo API: `npm run test:e2e:api` no `fincore` sobe esta
+      API com PGlite em memória na porta 8090 (12/11/2026).
 - [ ] `npm audit`: avisos moderados apenas em dependências de desenvolvimento do
       `drizzle-kit` (esbuild antigo); não vão para produção.

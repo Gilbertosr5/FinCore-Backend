@@ -53,8 +53,8 @@ export const nullableText = (max: number) =>
     .transform((value) => (value === undefined || value === null || value === '' ? null : value));
 
 export const tagsField = z
-  .array(z.string().trim().min(1).max(40))
-  .max(20, 'Máximo de 20 etiquetas.')
+  .array(z.string().trim().min(1).max(200, 'Etiqueta muito longa.'))
+  .max(100, 'Máximo de 100 etiquetas.')
   .default([]);
 
 /** Converte erros do Zod no formato `errors[]` do Problem Details. */

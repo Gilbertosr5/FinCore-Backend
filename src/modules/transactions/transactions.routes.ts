@@ -27,7 +27,7 @@ export function transactionRoutes(app: FastifyInstance): void {
 
   app.post('/transactions/batch', { bodyLimit: 5 * 1024 * 1024 }, async (request, reply) => {
     const batch = parseInput(batchSchema, request.body);
-    await commitBatch(db(), currentUserId(request), batch);
+    await commitBatch(db(), currentUserId(request), batch, app.deps.clock.today());
     return reply.status(204).send();
   });
 

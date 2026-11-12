@@ -4,15 +4,17 @@ import type { Db } from '../../db/client.js';
 import {
   accounts,
   assets,
+  cardPurchases,
   categories,
   creditCards,
   recurrences,
   transactions,
 } from '../../db/schema.js';
 import { recordAudit, type AuditInput } from '../../shared/audit.js';
-import { displayDate } from '../../shared/dates.js';
-import { AppError, type FieldError } from '../../shared/errors.js';
-import { displayMoney, formatMoney } from '../../shared/money.js';
+import { displayDate, type IsoDate } from '../../shared/dates.js';
+import { AppError, unprocessable, type FieldError } from '../../shared/errors.js';
+import { displayMoney, formatMoney, money, sumMoney } from '../../shared/money.js';
+import { invoiceTotal, openInvoiceMonth } from '../credit-cards/invoices.js';
 
 import type { BatchInput, RecurrenceInput, TransactionInput } from './transactions.schemas.js';
 
@@ -308,89 +310,226 @@ function transactionAudit(existing: TransactionRow | null, tx: TransactionInput)
 // Lote atômico
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pagamentos de fatura (mesmas regras do PayInvoiceUseCase do frontend)
+// ---------------------------------------------------------------------------
+
+/** O pagamento passa a liquidar (ou liquidar mais) a fatura? */
+function settlesMore(existing: TransactionRow | undefined, tx: TransactionInput): boolean {
+  if (tx.kind !== 'card_payment' || tx.status !== 'paid' || !tx.cardPayment) return false;
+  if (!existing || existing.status !== 'paid') return true;
+  return (
+    existing.cardPaymentCardId !== tx.cardPayment.cardId ||
+    existing.cardPaymentInvoiceMonth !== tx.cardPayment.invoiceMonth ||
+    money(tx.amount).greaterThan(existing.amount)
+  );
+}
+
+/**
+ * Recusa pagar fatura futura, fatura sem saldo em aberto ou valor acima do saldo
+ * em aberto (ADR 0010). Pagamentos já gravados e inalterados não são revalidados.
+ */
+async function validateCardPayments(
+  db: Db,
+  userId: string,
+  batch: BatchInput,
+  existingById: ReadonlyMap<string, TransactionRow>,
+  today: IsoDate,
+): Promise<void> {
+  const indexed = batch.upsert
+    .map((tx, index) => ({ tx, index }))
+    .filter(({ tx }) => settlesMore(existingById.get(tx.id), tx));
+  if (indexed.length === 0) return;
+
+  const touched = new Set([...batch.upsert.map((tx) => tx.id), ...batch.remove]);
+  // Pagamentos do lote que já liquidam (validados ou não) contam no saldo da fatura.
+  const batchPaid = batch.upsert.filter(
+    (tx) => tx.kind === 'card_payment' && tx.status === 'paid' && tx.cardPayment,
+  );
+
+  for (const { tx, index } of indexed) {
+    const link = tx.cardPayment;
+    if (!link) continue;
+    const field = (name: string) => `upsert[${String(index)}].${name}`;
+    const card = await findCardDays(db, userId, link.cardId);
+    if (!card) continue; // validateReferences já recusou
+    if (tx.paidDate !== null && tx.paidDate > today) {
+      throw unprocessable(
+        'A data do pagamento não pode ser futura.',
+        'CARD_PAYMENT_FUTURE_DATE',
+        field('paidDate'),
+      );
+    }
+    const month = link.invoiceMonth;
+    if (month > openInvoiceMonth(card, today)) {
+      throw unprocessable(
+        `A fatura de ${displayMonth(month)} ainda não está aberta.`,
+        'INVOICE_NOT_OPEN',
+        field('cardPayment.invoiceMonth'),
+      );
+    }
+    const [purchases, stored] = await Promise.all([
+      db
+        .select()
+        .from(cardPurchases)
+        .where(and(eq(cardPurchases.userId, userId), eq(cardPurchases.cardId, link.cardId))),
+      db
+        .select({ id: transactions.id, amount: transactions.amount })
+        .from(transactions)
+        .where(
+          and(
+            eq(transactions.userId, userId),
+            eq(transactions.kind, 'card_payment'),
+            eq(transactions.status, 'paid'),
+            eq(transactions.cardPaymentCardId, link.cardId),
+            eq(transactions.cardPaymentInvoiceMonth, month),
+          ),
+        ),
+    ]);
+    const total = invoiceTotal(card, purchases, month);
+    // Outros pagamentos da mesma fatura: gravados (fora do lote) + os anteriores no lote.
+    const others = [
+      ...stored.filter((row) => !touched.has(row.id)).map((row) => row.amount),
+      ...batchPaid
+        .filter(
+          (other) =>
+            other.id !== tx.id &&
+            batch.upsert.indexOf(other) < index &&
+            other.cardPayment?.cardId === link.cardId &&
+            other.cardPayment.invoiceMonth === month,
+        )
+        .map((other) => other.amount),
+    ];
+    const outstanding = total.minus(sumMoney(others));
+    if (!outstanding.greaterThan(0)) {
+      throw unprocessable(
+        `A fatura de ${displayMonth(month)} não tem saldo em aberto.`,
+        'INVOICE_NOT_PAYABLE',
+        field('cardPayment.invoiceMonth'),
+      );
+    }
+    if (money(tx.amount).greaterThan(outstanding)) {
+      throw unprocessable(
+        `O valor excede o saldo em aberto da fatura (${displayMoney(outstanding)}).`,
+        'CARD_PAYMENT_EXCEEDS_OUTSTANDING',
+        field('amount'),
+      );
+    }
+  }
+}
+
+async function findCardDays(db: Db, userId: string, cardId: string) {
+  const [row] = await db
+    .select({ closingDay: creditCards.closingDay, dueDay: creditCards.dueDay })
+    .from(creditCards)
+    .where(and(eq(creditCards.userId, userId), eq(creditCards.id, cardId)))
+    .limit(1);
+  return row ?? null;
+}
+
+const MONTHS = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+const displayMonth = (month: string) =>
+  `${MONTHS[Number(month.slice(5, 7)) - 1] ?? month.slice(5, 7)}/${month.slice(0, 4)}`;
+
 /**
  * `POST /transactions/batch`: grava e remove lançamentos e recorrências em
  * uma única transação do banco (tudo ou nada), com o histórico junto.
  * Gravações são "cria ou substitui" (idempotentes).
  */
-export async function commitBatch(db: Db, userId: string, batch: BatchInput): Promise<void> {
-  await db.transaction(async (tx) => {
-    await validateReferences(tx, userId, batch);
-    const audit: AuditInput[] = [];
+export async function commitBatch(
+  db: Db,
+  userId: string,
+  batch: BatchInput,
+  today: IsoDate,
+): Promise<void> {
+  await db.transaction((tx) => applyBatch(tx, userId, batch, today));
+}
 
-    // Recorrências primeiro: ocorrências podem referenciá-las.
-    for (const rec of batch.upsertRecurrences) {
-      const [existing] = await tx
-        .select({ id: recurrences.id })
-        .from(recurrences)
-        .where(and(eq(recurrences.userId, userId), eq(recurrences.id, rec.id)))
-        .limit(1);
-      const values = toRecurrenceValues(userId, rec);
-      await tx
-        .insert(recurrences)
-        .values(values)
-        .onConflictDoUpdate({ target: [recurrences.userId, recurrences.id], set: values });
+/**
+ * Aplica o lote dentro de uma transação já aberta — usado também pelos
+ * endpoints que gravam um registro e seus lançamentos juntos (aporte de meta,
+ * movimentação de investimento).
+ */
+export async function applyBatch(
+  tx: Db,
+  userId: string,
+  batch: BatchInput,
+  today: IsoDate,
+): Promise<void> {
+  await validateReferences(tx, userId, batch);
+  const audit: AuditInput[] = [];
+
+  // Recorrências primeiro: ocorrências podem referenciá-las.
+  for (const rec of batch.upsertRecurrences) {
+    const [existing] = await tx
+      .select({ id: recurrences.id })
+      .from(recurrences)
+      .where(and(eq(recurrences.userId, userId), eq(recurrences.id, rec.id)))
+      .limit(1);
+    const values = toRecurrenceValues(userId, rec);
+    await tx
+      .insert(recurrences)
+      .values(values)
+      .onConflictDoUpdate({ target: [recurrences.userId, recurrences.id], set: values });
+    audit.push({
+      entityType: 'recurrence',
+      entityId: rec.id,
+      action: existing ? 'updated' : 'created',
+      summary: existing
+        ? `Recorrência atualizada: ${rec.template.description}.`
+        : `Recorrência criada: ${rec.template.description} — ${displayMoney(rec.template.amount)}.`,
+    });
+  }
+
+  const upsertIds = batch.upsert.map((item) => item.id);
+  const existingRows =
+    upsertIds.length === 0
+      ? []
+      : await tx
+          .select()
+          .from(transactions)
+          .where(and(eq(transactions.userId, userId), inArray(transactions.id, upsertIds)));
+  const existingById = new Map(existingRows.map((row) => [row.id, row]));
+  await validateCardPayments(tx, userId, batch, existingById, today);
+
+  for (const item of batch.upsert) {
+    const values = toTransactionValues(userId, item);
+    await tx
+      .insert(transactions)
+      .values(values)
+      .onConflictDoUpdate({ target: [transactions.userId, transactions.id], set: values });
+    audit.push(transactionAudit(existingById.get(item.id) ?? null, item));
+  }
+
+  if (batch.remove.length > 0) {
+    const removed = await tx
+      .delete(transactions)
+      .where(and(eq(transactions.userId, userId), inArray(transactions.id, batch.remove)))
+      .returning({ id: transactions.id, description: transactions.description });
+    for (const row of removed) {
       audit.push({
-        entityType: 'recurrence',
-        entityId: rec.id,
-        action: existing ? 'updated' : 'created',
-        summary: existing
-          ? `Recorrência atualizada: ${rec.template.description}.`
-          : `Recorrência criada: ${rec.template.description} — ${displayMoney(rec.template.amount)}.`,
+        entityType: 'transaction',
+        entityId: row.id,
+        action: 'deleted',
+        summary: `Lançamento excluído: ${row.description}.`,
       });
     }
+  }
 
-    const upsertIds = batch.upsert.map((item) => item.id);
-    const existingRows =
-      upsertIds.length === 0
-        ? []
-        : await tx
-            .select()
-            .from(transactions)
-            .where(and(eq(transactions.userId, userId), inArray(transactions.id, upsertIds)));
-    const existingById = new Map(existingRows.map((row) => [row.id, row]));
-
-    for (const item of batch.upsert) {
-      const values = toTransactionValues(userId, item);
-      await tx
-        .insert(transactions)
-        .values(values)
-        .onConflictDoUpdate({ target: [transactions.userId, transactions.id], set: values });
-      audit.push(transactionAudit(existingById.get(item.id) ?? null, item));
+  if (batch.removeRecurrences.length > 0) {
+    const removed = await tx
+      .delete(recurrences)
+      .where(and(eq(recurrences.userId, userId), inArray(recurrences.id, batch.removeRecurrences)))
+      .returning({ id: recurrences.id, description: recurrences.templateDescription });
+    for (const row of removed) {
+      audit.push({
+        entityType: 'recurrence',
+        entityId: row.id,
+        action: 'deleted',
+        summary: `Recorrência excluída: ${row.description}.`,
+      });
     }
+  }
 
-    if (batch.remove.length > 0) {
-      const removed = await tx
-        .delete(transactions)
-        .where(and(eq(transactions.userId, userId), inArray(transactions.id, batch.remove)))
-        .returning({ id: transactions.id, description: transactions.description });
-      for (const row of removed) {
-        audit.push({
-          entityType: 'transaction',
-          entityId: row.id,
-          action: 'deleted',
-          summary: `Lançamento excluído: ${row.description}.`,
-        });
-      }
-    }
-
-    if (batch.removeRecurrences.length > 0) {
-      const removed = await tx
-        .delete(recurrences)
-        .where(
-          and(eq(recurrences.userId, userId), inArray(recurrences.id, batch.removeRecurrences)),
-        )
-        .returning({ id: recurrences.id, description: recurrences.templateDescription });
-      for (const row of removed) {
-        audit.push({
-          entityType: 'recurrence',
-          entityId: row.id,
-          action: 'deleted',
-          summary: `Recorrência excluída: ${row.description}.`,
-        });
-      }
-    }
-
-    await recordAudit(tx, userId, audit);
-  });
+  await recordAudit(tx, userId, audit);
 }

@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import type { Db } from '../../db/client.js';
-import { goalContributions, goals } from '../../db/schema.js';
+import { goalContributions, goals, transactions } from '../../db/schema.js';
 import { currentUserId } from '../../http/security.js';
 import { recordAudit, type AuditAction } from '../../shared/audit.js';
 import { displayDate, type IsoDate } from '../../shared/dates.js';
@@ -22,6 +22,8 @@ import {
   requiredText,
 } from '../../shared/validation.js';
 import { findAccount } from '../accounts/accounts.module.js';
+import { transactionSchema, type TransactionInput } from '../transactions/transactions.schemas.js';
+import { applyBatch } from '../transactions/transactions.service.js';
 
 export const goalSchema = z
   .object({
@@ -59,6 +61,49 @@ export const contributionSchema = z.object({
   transferId: nullableId,
 });
 type ContributionInput = z.output<typeof contributionSchema>;
+
+/**
+ * Corpo do `PUT /goals/contributions/{id}`: o aporte e, opcionalmente, as duas
+ * pernas da transferência entre contas gravadas na mesma transação do banco.
+ */
+const contributionWriteSchema = contributionSchema.extend({
+  transactions: z.array(transactionSchema).max(2).default([]),
+});
+type ContributionWrite = z.output<typeof contributionWriteSchema>;
+
+/** As pernas enviadas precisam ser a transferência do aporte, envolvendo a conta da meta. */
+function assertTransferLegs(
+  input: ContributionInput,
+  goalAccountId: string | null,
+  legs: readonly TransactionInput[],
+): void {
+  const fail = (detail: string) =>
+    unprocessable(detail, 'CONTRIBUTION_TRANSFER_MISMATCH', 'transactions');
+  if (input.transferId === null) throw fail('Informe transferId para gravar a transferência.');
+  if (goalAccountId === null) throw fail('A meta não tem conta vinculada.');
+  const [first, second] = legs;
+  if (legs.length !== 2 || !first || !second) {
+    throw fail('A transferência deve ter as duas pernas.');
+  }
+  for (const leg of legs) {
+    if (leg.kind !== 'transfer' || leg.transfer?.id !== input.transferId) {
+      throw fail('As pernas devem pertencer à transferência informada em transferId.');
+    }
+    if (!money(leg.amount).equals(money(input.amount))) {
+      throw fail('A transferência deve ter o mesmo valor do aporte.');
+    }
+  }
+  // Aporte: dinheiro entra na conta da meta; retirada: sai dela.
+  const goalSide = input.type === 'deposit' ? 'in' : 'out';
+  const goalLeg = legs.find((leg) => leg.transfer?.direction === goalSide);
+  if (goalLeg?.accountId !== goalAccountId) {
+    throw fail(
+      input.type === 'deposit'
+        ? 'A transferência do aporte deve entrar na conta da meta.'
+        : 'A transferência da retirada deve sair da conta da meta.',
+    );
+  }
+}
 
 type GoalRow = typeof goals.$inferSelect;
 type ContributionRow = typeof goalContributions.$inferSelect;
@@ -203,7 +248,8 @@ async function deleteGoal(db: Db, userId: string, id: string) {
   });
 }
 
-async function saveContribution(db: Db, userId: string, input: ContributionInput, today: IsoDate) {
+async function saveContribution(db: Db, userId: string, body: ContributionWrite, today: IsoDate) {
+  const { transactions: legs, ...input } = body;
   return db.transaction(async (tx) => {
     const goal = await findGoal(tx, userId, input.goalId);
     if (!goal) throw unprocessable('Meta inexistente.', 'GOAL_NOT_FOUND', 'goalId');
@@ -238,6 +284,15 @@ async function saveContribution(db: Db, userId: string, input: ContributionInput
         'amount',
       );
     }
+    if (legs.length > 0) {
+      assertTransferLegs(input, goal.accountId, legs);
+      await applyBatch(
+        tx,
+        userId,
+        { upsert: legs, remove: [], upsertRecurrences: [], removeRecurrences: [] },
+        today,
+      );
+    }
     const values = { ...input, userId, updatedAt: new Date() };
     const [row] = await tx
       .insert(goalContributions)
@@ -258,7 +313,8 @@ async function saveContribution(db: Db, userId: string, input: ContributionInput
   });
 }
 
-async function deleteContribution(db: Db, userId: string, id: string) {
+/** Exclui o aporte e as pernas da transferência vinculada (se ainda existirem) juntos. */
+async function deleteContribution(db: Db, userId: string, id: string, today: IsoDate) {
   await db.transaction(async (tx) => {
     const existing = await findContribution(tx, userId, id);
     if (!existing) throw notFound('Aporte não encontrado.');
@@ -274,6 +330,27 @@ async function deleteContribution(db: Db, userId: string, id: string) {
     await tx
       .delete(goalContributions)
       .where(and(eq(goalContributions.userId, userId), eq(goalContributions.id, id)));
+    if (existing.transferId !== null) {
+      const legs = await tx
+        .select({ id: transactions.id })
+        .from(transactions)
+        .where(
+          and(eq(transactions.userId, userId), eq(transactions.transferId, existing.transferId)),
+        );
+      if (legs.length > 0) {
+        await applyBatch(
+          tx,
+          userId,
+          {
+            upsert: [],
+            remove: legs.map((leg) => leg.id),
+            upsertRecurrences: [],
+            removeRecurrences: [],
+          },
+          today,
+        );
+      }
+    }
     await recordAudit(tx, userId, [
       {
         entityType: 'goal',
@@ -308,14 +385,14 @@ export function goalRoutes(app: FastifyInstance): void {
 
   app.put('/goals/contributions/:id', async (request) => {
     const { id } = parseInput(idParams, request.params);
-    const input = parseInput(contributionSchema, request.body);
+    const input = parseInput(contributionWriteSchema, request.body);
     assertSameId(id, input.id);
     return saveContribution(db(), currentUserId(request), input, app.deps.clock.today());
   });
 
   app.delete('/goals/contributions/:id', async (request, reply) => {
     const { id } = parseInput(idParams, request.params);
-    await deleteContribution(db(), currentUserId(request), id);
+    await deleteContribution(db(), currentUserId(request), id, app.deps.clock.today());
     return reply.status(204).send();
   });
 

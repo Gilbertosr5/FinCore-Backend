@@ -3,12 +3,18 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import type { Db } from '../../db/client.js';
-import { assetValuations, assets, investmentMovements } from '../../db/schema.js';
+import { assetValuations, assets, investmentMovements, transactions } from '../../db/schema.js';
 import { currentUserId } from '../../http/security.js';
 import { recordAudit } from '../../shared/audit.js';
 import { displayDate, type IsoDate } from '../../shared/dates.js';
 import { conflict, notFound, unprocessable } from '../../shared/errors.js';
-import { displayMoney, formatMoney, formatQuantity, MoneyDecimal } from '../../shared/money.js';
+import {
+  displayMoney,
+  formatMoney,
+  formatQuantity,
+  money,
+  MoneyDecimal,
+} from '../../shared/money.js';
 import {
   assertSameId,
   idField,
@@ -21,6 +27,10 @@ import {
   positiveMoneyField,
   requiredText,
 } from '../../shared/validation.js';
+import { transactionSchema, type TransactionInput } from '../transactions/transactions.schemas.js';
+import { applyBatch } from '../transactions/transactions.service.js';
+
+import { CAPITAL_IN, CAPITAL_OUT, positionValue, sortMovements } from './position.js';
 
 // ---------------------------------------------------------------------------
 // Regras (ADR 0012 do frontend)
@@ -68,21 +78,6 @@ export function allowedMovementTypes(assetClass: string): MovementType[] {
   return [...capital, 'dividend', 'interest', 'income', 'fee', 'tax'];
 }
 
-const CAPITAL_IN = new Set<string>(['contribution', 'buy']);
-const CAPITAL_OUT = new Set<string>(['sell', 'redemption']);
-/** Ordem no mesmo dia: entradas antes de saídas (igual ao frontend). */
-const TYPE_ORDER: Record<string, number> = {
-  contribution: 0,
-  buy: 0,
-  fee: 1,
-  dividend: 2,
-  interest: 2,
-  income: 2,
-  tax: 3,
-  sell: 4,
-  redemption: 4,
-};
-
 interface QuantityFlow {
   id: string;
   type: string;
@@ -92,13 +87,7 @@ interface QuantityFlow {
 
 /** Primeira venda que excede a quantidade em carteira; null se a sequência é válida. */
 export function findOversell<T extends QuantityFlow>(movements: readonly T[]): T | null {
-  const ordered = [...movements].sort((a, b) =>
-    a.date === b.date
-      ? (TYPE_ORDER[a.type] ?? 9) - (TYPE_ORDER[b.type] ?? 9)
-      : a.date < b.date
-        ? -1
-        : 1,
-  );
+  const ordered = sortMovements(movements);
   let held = new MoneyDecimal(0);
   for (const item of ordered) {
     if (item.quantity === null) continue;
@@ -141,6 +130,51 @@ export const movementSchema = z.object({
   transactionId: nullableId,
 });
 type MovementInput = z.output<typeof movementSchema>;
+
+/**
+ * Corpo do `PUT /investments/movements/{id}`: a movimentação e, opcionalmente, o
+ * lançamento da conta (aplicação/resgate/proventos) gravados na mesma transação.
+ */
+const movementWriteSchema = movementSchema.extend({
+  transaction: transactionSchema.nullish().transform((value) => value ?? null),
+});
+type MovementWrite = z.output<typeof movementWriteSchema>;
+
+const INCOME_MOVEMENTS = new Set<string>(['dividend', 'interest', 'income']);
+
+/** O lançamento enviado precisa corresponder exatamente à movimentação. */
+function assertLinkedTransaction(input: MovementInput, linked: TransactionInput): void {
+  const fail = (detail: string) =>
+    unprocessable(detail, 'MOVEMENT_TRANSACTION_MISMATCH', 'transaction');
+  if (input.transactionId !== linked.id) {
+    throw fail('O lançamento deve ter o id informado em transactionId.');
+  }
+  if (!money(linked.amount).equals(money(input.amount)) || linked.status !== 'paid') {
+    throw fail('O lançamento deve estar pago e ter o mesmo valor da movimentação.');
+  }
+  if (linked.paidDate !== input.date) {
+    throw fail('O lançamento deve ser pago na data da movimentação.');
+  }
+  if (INCOME_MOVEMENTS.has(input.type)) {
+    if (linked.kind !== 'income') throw fail('Proventos geram um lançamento de receita.');
+    return;
+  }
+  const direction = CAPITAL_IN.has(input.type)
+    ? 'application'
+    : CAPITAL_OUT.has(input.type)
+      ? 'redemption'
+      : null;
+  if (direction === null) {
+    throw fail('Taxas e impostos não geram lançamento na conta.');
+  }
+  if (
+    linked.kind !== 'investment' ||
+    linked.investment?.assetId !== input.assetId ||
+    linked.investment.direction !== direction
+  ) {
+    throw fail('O lançamento deve ser uma movimentação de investimento do mesmo ativo.');
+  }
+}
 
 export const valuationSchema = z.object({
   id: idField,
@@ -283,7 +317,8 @@ const MOVEMENT_LABELS: Record<MovementType, string> = {
   tax: 'Impostos',
 };
 
-async function saveMovement(db: Db, userId: string, input: MovementInput, today: IsoDate) {
+async function saveMovement(db: Db, userId: string, body: MovementWrite, today: IsoDate) {
+  const { transaction: linked, ...input } = body;
   return db.transaction(async (tx) => {
     const asset = await findAsset(tx, userId, input.assetId);
     if (!asset) throw unprocessable('Ativo inexistente.', 'ASSET_NOT_FOUND', 'assetId');
@@ -332,6 +367,29 @@ async function saveMovement(db: Db, userId: string, input: MovementInput, today:
         'quantity',
       );
     }
+    if (input.type === 'redemption') {
+      const valuations = await tx
+        .select({ date: assetValuations.date, value: assetValuations.value })
+        .from(assetValuations)
+        .where(and(eq(assetValuations.userId, userId), eq(assetValuations.assetId, input.assetId)));
+      const available = positionValue(others, valuations, input.date);
+      if (money(input.amount).greaterThan(available)) {
+        throw unprocessable(
+          `O resgate excede o valor da posição em ${displayDate(input.date)} (${displayMoney(available)}). Atualize o valor atual antes.`,
+          'MOVEMENT_EXCEEDS_POSITION',
+          'amount',
+        );
+      }
+    }
+    if (linked) {
+      assertLinkedTransaction(input, linked);
+      await applyBatch(
+        tx,
+        userId,
+        { upsert: [linked], remove: [], upsertRecurrences: [], removeRecurrences: [] },
+        today,
+      );
+    }
     const values = { ...input, userId, updatedAt: new Date() };
     const [row] = await tx
       .insert(investmentMovements)
@@ -354,7 +412,8 @@ async function saveMovement(db: Db, userId: string, input: MovementInput, today:
   });
 }
 
-async function deleteMovement(db: Db, userId: string, id: string) {
+/** Exclui a movimentação e o lançamento vinculado (se ainda existir) juntos. */
+async function deleteMovement(db: Db, userId: string, id: string, today: IsoDate) {
   await db.transaction(async (tx) => {
     const [existing] = await tx
       .select()
@@ -374,6 +433,21 @@ async function deleteMovement(db: Db, userId: string, id: string) {
     await tx
       .delete(investmentMovements)
       .where(and(eq(investmentMovements.userId, userId), eq(investmentMovements.id, id)));
+    if (existing.transactionId !== null) {
+      const [linked] = await tx
+        .select({ id: transactions.id })
+        .from(transactions)
+        .where(and(eq(transactions.userId, userId), eq(transactions.id, existing.transactionId)))
+        .limit(1);
+      if (linked) {
+        await applyBatch(
+          tx,
+          userId,
+          { upsert: [], remove: [linked.id], upsertRecurrences: [], removeRecurrences: [] },
+          today,
+        );
+      }
+    }
     await recordAudit(tx, userId, [
       {
         entityType: 'asset',
@@ -505,14 +579,14 @@ export function investmentRoutes(app: FastifyInstance): void {
 
   app.put('/investments/movements/:id', async (request) => {
     const { id } = parseInput(idParams, request.params);
-    const input = parseInput(movementSchema, request.body);
+    const input = parseInput(movementWriteSchema, request.body);
     assertSameId(id, input.id);
     return saveMovement(db(), currentUserId(request), input, app.deps.clock.today());
   });
 
   app.delete('/investments/movements/:id', async (request, reply) => {
     const { id } = parseInput(idParams, request.params);
-    await deleteMovement(db(), currentUserId(request), id);
+    await deleteMovement(db(), currentUserId(request), id, app.deps.clock.today());
     return reply.status(204).send();
   });
 
